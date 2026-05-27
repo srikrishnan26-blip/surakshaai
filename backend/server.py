@@ -12,6 +12,9 @@ import uuid
 from datetime import datetime, timezone
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 from emergentintegrations.llm.openai import OpenAISpeechToText
+from twilio.rest import Client as TwilioClient
+from twilio.base.exceptions import TwilioRestException
+import asyncio
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -23,6 +26,52 @@ db = client[os.environ['DB_NAME']]
 
 # Emergent LLM key
 EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
+
+# Twilio SMS client (lazy-initialized so backend still boots if credentials are missing)
+TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '')
+TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '')
+TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER', '')
+twilio_client = (
+    TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN
+    else None
+)
+
+
+def _send_sms_sync(to_number: str, body: str) -> dict:
+    """Synchronous Twilio send used inside a thread."""
+    if not twilio_client or not TWILIO_PHONE_NUMBER:
+        return {"to": to_number, "status": "skipped", "error": "Twilio not configured"}
+    try:
+        msg = twilio_client.messages.create(body=body, from_=TWILIO_PHONE_NUMBER, to=to_number)
+        return {"to": to_number, "status": msg.status, "sid": msg.sid}
+    except TwilioRestException as e:
+        return {"to": to_number, "status": "failed", "error": f"{e.code}: {e.msg}"}
+    except Exception as e:
+        return {"to": to_number, "status": "failed", "error": str(e)}
+
+
+async def send_sos_sms(contacts: list, user_name: str, latitude: float, longitude: float, custom_message: str = "") -> list:
+    """Send SOS SMS to all emergency contacts in parallel threads."""
+    if not contacts:
+        return []
+    map_link = f"https://maps.google.com/?q={latitude},{longitude}"
+    base_body = (
+        f"🚨 SOS Alert from {user_name or 'SurakshaAI user'}!\n"
+        f"They need help. Location: {map_link}\n"
+    )
+    if custom_message:
+        base_body += f"Message: {custom_message}\n"
+    base_body += "— Sent via SurakshaAI"
+
+    loop = asyncio.get_event_loop()
+    tasks = [
+        loop.run_in_executor(None, _send_sms_sync, c["phone"], base_body)
+        for c in contacts
+        if c.get("phone")
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    return results
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -78,6 +127,9 @@ class SOSResponse(BaseModel):
     alert_id: str
     status: str
     contacts_notified: int
+    sms_sent: int = 0
+    sms_failed: int = 0
+    sms_results: List[dict] = []
     timestamp: str
 
 class TrackingUpdate(BaseModel):
@@ -223,16 +275,35 @@ async def trigger_sos(data: SOSRequest):
     
     # Get contacts to notify
     contacts = await db.contacts.find({"user_id": data.user_id}, {"_id": 0}).to_list(100)
-    contacts_notified = len(contacts)
-    
-    # Log the SOS for tracking
-    logger.warning(f"SOS ALERT: User {data.user_id} at ({data.latitude}, {data.longitude})")
-    
+
+    # Get user name for SMS personalization
+    user = await db.users.find_one({"user_id": data.user_id}, {"_id": 0})
+    user_name = user["name"] if user else ""
+
+    # Dispatch SMS to every contact via Twilio
+    sms_results = await send_sos_sms(
+        contacts=contacts,
+        user_name=user_name,
+        latitude=data.latitude,
+        longitude=data.longitude,
+        custom_message=data.message,
+    )
+    sent_count = sum(1 for r in sms_results if r.get("status") not in ("failed", "skipped"))
+    failed_count = sum(1 for r in sms_results if r.get("status") in ("failed", "skipped"))
+
+    logger.warning(
+        f"SOS ALERT: User {data.user_id} at ({data.latitude}, {data.longitude}) — "
+        f"SMS sent={sent_count}, failed={failed_count}"
+    )
+
     return SOSResponse(
         alert_id=alert_id,
         status="active",
-        contacts_notified=contacts_notified,
-        timestamp=timestamp
+        contacts_notified=len(contacts),
+        sms_sent=sent_count,
+        sms_failed=failed_count,
+        sms_results=sms_results,
+        timestamp=timestamp,
     )
 
 @api_router.get("/sos/{user_id}")
@@ -370,10 +441,29 @@ async def voice_sos(
             }
             await db.sos_alerts.insert_one(alert)
             contacts = await db.contacts.find({"user_id": user_id}, {"_id": 0}).to_list(100)
+            user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+            user_name = user["name"] if user else ""
+
+            sms_results = await send_sos_sms(
+                contacts=contacts,
+                user_name=user_name,
+                latitude=latitude,
+                longitude=longitude,
+                custom_message=f"Voice-triggered SOS (word: '{matched_word}')",
+            )
+            sent_count = sum(1 for r in sms_results if r.get("status") not in ("failed", "skipped"))
+            failed_count = sum(1 for r in sms_results if r.get("status") in ("failed", "skipped"))
+
             result["alert_id"] = alert_id
             result["contacts_notified"] = len(contacts)
+            result["sms_sent"] = sent_count
+            result["sms_failed"] = failed_count
+            result["sms_results"] = sms_results
             result["timestamp"] = timestamp
-            logger.warning(f"VOICE SOS ALERT: User {user_id} at ({latitude}, {longitude}) - '{matched_word}'")
+            logger.warning(
+                f"VOICE SOS ALERT: User {user_id} at ({latitude}, {longitude}) — "
+                f"trigger='{matched_word}', SMS sent={sent_count}, failed={failed_count}"
+            )
 
         return result
 
